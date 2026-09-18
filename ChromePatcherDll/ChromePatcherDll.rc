@@ -51,8 +51,8 @@ END
 //
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 7,0,0,0
- PRODUCTVERSION 6,0,0,0
+ FILEVERSION 7,1,1,0
+ PRODUCTVERSION 7,1,1,0
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS 0x1L
@@ -68,13 +68,13 @@ BEGIN
         BLOCK "040004b0"
         BEGIN
             VALUE "CompanyName", "Ceiridge"
-            VALUE "FileDescription", "Patches Chromium and disables the developer extension warning among others (https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher)"
-            VALUE "FileVersion", "7.0.0.0"
+            VALUE "FileDescription", "Guarded forward-compatible Edge developer extension warning patcher"
+            VALUE "FileVersion", "7.1.1.0"
             VALUE "InternalName", "ChromePatcherDll.dll"
             VALUE "LegalCopyright", "GNU General Public License 3, Ceiridge"
             VALUE "OriginalFilename", "ChromePatcherDll.dll"
             VALUE "ProductName", "Chromium Developer Extension Warning Patcher"
-            VALUE "ProductVersion", "6.0.0.0"
+            VALUE "ProductVersion", "7.1.1.0"
         END
     END
     BLOCK "VarFileInfo"

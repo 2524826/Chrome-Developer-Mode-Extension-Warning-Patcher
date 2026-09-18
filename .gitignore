@@ -17,6 +17,7 @@
 mono_crash.*
 
 # Build results
+/build/
 [Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
@@ -354,3 +355,11 @@ MigrationBackup/
 
 # Custom Build Temporary Files
 ChromeDllInjector.zip
+
+# Local Edge fixtures, dry-run reports, backups, and diagnostics
+local-fixtures/
+outputs/
+backups/
+environment-report*.json
+dry-run*.json
+*.bak

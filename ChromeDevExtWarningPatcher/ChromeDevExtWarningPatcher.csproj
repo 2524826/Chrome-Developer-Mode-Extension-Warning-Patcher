@@ -3,13 +3,14 @@
   <PropertyGroup>
 	<OutputType>Exe</OutputType>
 	<TargetFramework>net6.0-windows10.0.17763.0</TargetFramework>
+	<ImplicitUsings>enable</ImplicitUsings>
 	<Nullable>enable</Nullable>
 	<UseWPF>true</UseWPF>
-	<Version>6.0.0.0</Version>
+	<Version>7.1.1.0</Version>
 	<Authors>Ceiridge</Authors>
 	<Company />
 	<Product>Chromium Developer Extension Warning Patcher</Product>
-	<Description>Patches Chromium and disables the developer extension warning among others</Description>
+	<Description>Guarded forward-compatible Microsoft Edge developer-mode extension warning patcher</Description>
 	<Copyright>GNU General Public License 3, Ceiridge</Copyright>
 	<PackageLicenseFile>LICENSE</PackageLicenseFile>
 	<PackageProjectUrl>https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher</PackageProjectUrl>
@@ -19,7 +20,8 @@
 	<EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
 	<StartupObject>ChromeDevExtWarningPatcher.MainClass</StartupObject>
 	<ApplicationManifest>app.manifest</ApplicationManifest>
-	<AssemblyVersion>6.0.0.0</AssemblyVersion>
+	<AssemblyVersion>7.1.1.0</AssemblyVersion>
+	<IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 	<SupportedOSPlatformVersion>7.0</SupportedOSPlatformVersion>
   </PropertyGroup>
 
@@ -28,6 +30,18 @@
 	  <Pack>True</Pack>
 	  <PackagePath></PackagePath>
 	</None>
+  </ItemGroup>
+
+  <ItemGroup>
+	<EmbeddedResource Include="..\patterns.xml" Link="patterns.xml" LogicalName="ChromeDevExtWarningPatcher.patterns.xml" />
+  </ItemGroup>
+
+  <ItemGroup>
+	<Compile Include="..\EdgeWarningPatcher.Verifier\AobPattern.cs" Link="Verifier\AobPattern.cs" />
+	<Compile Include="..\EdgeWarningPatcher.Verifier\PatchRule.cs" Link="Verifier\PatchRule.cs" />
+	<Compile Include="..\EdgeWarningPatcher.Verifier\PatchVerifier.cs" Link="Verifier\PatchVerifier.cs" />
+	<Compile Include="..\EdgeWarningPatcher.Verifier\PeImage.cs" Link="Verifier\PeImage.cs" />
+	<Compile Include="..\EdgeWarningPatcher.Verifier\RuleLoader.cs" Link="Verifier\RuleLoader.cs" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,0 +1,10 @@
+# Known issues and unverified items
+
+- Manual end-to-end installation was not run in this session: the current process is not elevated and no disposable rebootable Edge test environment was available. Warning disappearance, extension operation after injection, restart persistence, and uninstall behavior therefore remain unverified.
+- The WPF installer still targets .NET 6 and uses its historical NuGet dependencies. Its Release project compiled successfully after an official-package loopback workaround, but this machine could not run the mixed managed/native solution as one command because its Visual Studio MSBuild lacks the .NET SDK resolver and `dotnet msbuild` cannot host the installed C++ tracking task. The updated hosted CI is intended to cover that clean-checkout path.
+- The native runtime validates the configured Edge application root, exact module name, minimum version, x64 PE architecture, `.text`, unique matches and original bytes. The versioned runtime configuration rejects files written by the previous exact-path build and therefore requires one reinstall when upgrading to this forward-compatible release.
+- The browser module is changed only in memory, so on-disk browser backup metadata and patched-file hashes do not exist. Runtime write failures roll back in memory; uninstall removes persistence and a browser restart restores original code pages.
+- Installer cleanup is inherited and best-effort for locked injector DLLs. It is not a hash-authenticated backup/restore system for the patcher's own files.
+- Only Edge Stable `151.0.4129.59` x64 has been manually analyzed. Edge 151 and later builds are eligible for automatic guarded matching, but are not validated merely because their version is newer. A changed or ambiguous signature fails closed. Beta/Dev/Canary remain outside the tested scope.
+- The exact persistence semantics of the panel's **Not now** action were inferred from symbols/older Chromium behavior, not dynamically traced on Edge 151.
+- Historical patch groups 1–6 and their old tests remain in the repository for compatibility/history, but are off by default and the maintenance installer refuses to enable them.

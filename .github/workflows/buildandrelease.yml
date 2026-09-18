@@ -1,88 +1,125 @@
-name: Build And Release
+name: Windows x64 release build
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: windows-2022
 
     steps:
-    # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-    - uses: actions/checkout@v2
-      with:
-        submodules: true
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Write code sign file
-      id: write_file
-      if: ${{ github.event_name == 'push' && endsWith(github.ref, '/master') }} # Never write code sign file on pull requests
-      uses: Ceiridge/base64-to-file@master
-      with:
-        fileName: 'codesign.pfx'
-        encodedString: ${{ secrets.CODE_SIGN_PFX }}
+      - name: Install .NET 6 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
 
-    - name: Copy code sign file
-      if: ${{ github.event_name == 'push' && endsWith(github.ref, '/master') }} # Never write code sign file on pull requests
-      shell: cmd
-      env:
-        PFXLOC: ${{ steps.write_file.outputs.filePath }}
-      run: |
-        copy /Y %PFXLOC% codesign.pfx
-        dir
+      - name: Configure MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-    - name: Add signtool to PATH
-      shell: powershell
-      run: |
-        echo "C:\Program Files (x86)\Windows Kits\10\bin\10.0.19041.0\x64\" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Restore release projects
+        shell: powershell
+        run: |
+          dotnet restore .\ChromeDllInjectorBuildZipper\ChromeDllInjectorBuildZipper.csproj
+          dotnet restore .\ChromeDllInjector\ChromeDllInjector.csproj
+          dotnet restore .\ChromeDevExtWarningPatcher\ChromeDevExtWarningPatcher.csproj
 
+      - name: Build native Release x64
+        shell: powershell
+        run: |
+          $nativeOut = Join-Path $env:GITHUB_WORKSPACE 'x64\Release\'
+          New-Item -ItemType Directory -Path $nativeOut -Force | Out-Null
+          msbuild .\ChromePatcherDll\ChromePatcherDll.vcxproj /t:Rebuild /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$nativeOut" /p:ContinuousIntegrationBuild=true
 
+      - name: Build Injector and regenerate embedded injector ZIP
+        shell: powershell
+        run: |
+          dotnet build .\ChromeDllInjectorBuildZipper\ChromeDllInjectorBuildZipper.csproj -c Release --no-restore
+          dotnet build .\ChromeDllInjector\ChromeDllInjector.csproj -c Release --no-restore
 
+      - name: Build patcher Release x64 with embedded resources
+        shell: powershell
+        run: dotnet build .\ChromeDevExtWarningPatcher\ChromeDevExtWarningPatcher.csproj -c Release --no-restore
 
+      - name: Check release component versions and packaging inputs
+        shell: powershell
+        run: |
+          $expected = @{
+            'x64\Release\ChromePatcherDll.dll' = '7.1.1.0'
+            'ChromeDllInjector\bin\Release\net6.0-windows10.0.17763.0\ChromeDllInjector.dll' = '6.1.1.0'
+            'ChromeDevExtWarningPatcher\bin\Release\net6.0-windows10.0.17763.0\ChromeDevExtWarningPatcher.exe' = '7.1.1.0'
+          }
+          foreach ($entry in $expected.GetEnumerator()) {
+            $path = Join-Path $env:GITHUB_WORKSPACE $entry.Key
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release component: $path" }
+            $version = (Get-Item -LiteralPath $path).VersionInfo.FileVersion
+            if ($version -ne $entry.Value) { throw "Unexpected version for $path`: $version" }
+          }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'ChromeDllInjector.zip') -PathType Leaf)) { throw 'Missing regenerated ChromeDllInjector.zip' }
 
-    - name: Setup dotnet for use with actions
-      uses: actions/setup-dotnet@v3
-      with:
-        dotnet-version: '6.0.x'
+      - name: Package binary and source archives
+        shell: powershell
+        run: |
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
+          $binaryStage = Join-Path $artifactRoot 'edge-warning-patcher-7.1.1-windows-x64'
+          $sourceStage = Join-Path $artifactRoot 'edge-warning-patcher-7.1.1-source'
+          Remove-Item -LiteralPath $artifactRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $binaryStage, $sourceStage -Force | Out-Null
 
-    - name: Add msbuild to PATH
-      uses: microsoft/setup-msbuild@v1.1
+          Copy-Item README.md, README.zh-CN.md, LICENSE, patterns.xml, KNOWN_ISSUES.md -Destination $binaryStage
+          Copy-Item docs -Destination (Join-Path $binaryStage 'docs') -Recurse
+          $patcherStage = Join-Path $binaryStage 'patcher'
+          New-Item -ItemType Directory -Path $patcherStage -Force | Out-Null
+          Get-ChildItem -LiteralPath '.\ChromeDevExtWarningPatcher\bin\Release\net6.0-windows10.0.17763.0' -File -Recurse |
+            Where-Object { $_.Extension -notin @('.pdb', '.log') -and $_.Name -notlike 'appsettings*.json' } |
+            ForEach-Object {
+              $relative = [IO.Path]::GetRelativePath((Join-Path $env:GITHUB_WORKSPACE 'ChromeDevExtWarningPatcher\bin\Release\net6.0-windows10.0.17763.0'), $_.FullName)
+              $destination = Join-Path $patcherStage $relative
+              New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+              Copy-Item -LiteralPath $_.FullName -Destination $destination
+            }
+          Copy-Item '.\x64\Release\ChromePatcherDll.dll' -Destination $binaryStage
+          @'
+          7.1.1 release candidate
 
-    - name: Restore NuGet packages
-      shell: cmd
-      run: |
-        dotnet restore
+          This package is unsigned. Tests and test scripts were skipped at the user's request.
+          The patch is conditionally compatible with Edge 151 and later only when the complete guarded signature and expected bytes match uniquely.
+          '@ | Set-Content -LiteralPath (Join-Path $binaryStage 'RELEASE_NOTES_7.1.1.md') -Encoding utf8
 
-    - name: Build with MSBuild
-      run: |
-        msbuild ChromeDevExtWarningPatcher.sln -p:Configuration=Release
+          $binaryFiles = Get-ChildItem -LiteralPath $binaryStage -File -Recurse | Sort-Object FullName
+          $binaryFiles | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($binaryStage, $_.FullName).Replace('\', '/')
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $relative
+          } | Set-Content -LiteralPath (Join-Path $binaryStage 'SHA256SUMS.txt') -Encoding ascii
+          Compress-Archive -Path (Join-Path $binaryStage '*') -DestinationPath (Join-Path $artifactRoot 'edge-warning-patcher-7.1.1-windows-x64.zip')
 
+          $sourceTar = Join-Path $artifactRoot 'source.tar'
+          git archive --format=tar "--output=$sourceTar" HEAD
+          tar -xf $sourceTar -C $sourceStage
+          Remove-Item -LiteralPath $sourceTar -Force
+          Remove-Item -LiteralPath (Join-Path $sourceStage 'AGENTS.md'), (Join-Path $sourceStage 'ChromeDevExtWarningPatcher\localreadme.txt'), (Join-Path $sourceStage 'ChromeDevExtWarningPatcher\localsignall.bat') -Force -ErrorAction SilentlyContinue
+          $sourceFiles = Get-ChildItem -LiteralPath $sourceStage -File -Recurse | Sort-Object FullName
+          $sourceFiles | ForEach-Object {
+            $relative = [IO.Path]::GetRelativePath($sourceStage, $_.FullName).Replace('\', '/')
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $relative
+          } | Set-Content -LiteralPath (Join-Path $sourceStage 'SHA256SUMS.txt') -Encoding ascii
+          Compress-Archive -Path (Join-Path $sourceStage '*') -DestinationPath (Join-Path $artifactRoot 'edge-warning-patcher-7.1.1-source.zip')
 
+          Get-ChildItem -LiteralPath $artifactRoot -Filter '*.zip' -File | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.Name
+          } | Set-Content -LiteralPath (Join-Path $artifactRoot 'SHA256SUMS.txt') -Encoding ascii
 
-
-
-
-    - uses: actions/upload-artifact@v2
-      with:
-        name: built-gui-binaries
-        path: ChromeDevExtWarningPatcher/bin/Release/
-
-    - uses: actions/upload-artifact@v2
-      with:
-        name: built-native-binaries
-        path: x64/
-
-    - name: Zip the builds
-      shell: powershell
-      run: |
-        cd ChromeDevExtWarningPatcher\bin\Release\net6.0-windows10.0.17763.0;
-        Compress-Archive -DestinationPath ChromeDevExtWarningPatcher.zip -Path amd64,arm64,runtimes,x86,ChromeDevExtWarningPatcher.deps.json,ChromeDevExtWarningPatcher.dll,ChromeDevExtWarningPatcher.exe,ChromeDevExtWarningPatcher.pdb,ChromeDevExtWarningPatcher.runtimeconfig.json,CommandLine.dll,Dia2Lib.dll,MaterialDesignColors.dll,MaterialDesignThemes.Wpf.dll,Microsoft.Win32.SystemEvents.dll,Microsoft.Win32.TaskScheduler.dll,Microsoft.Windows.SDK.NET.dll,OSExtensions.dll,System.Drawing.Common.dll,TraceReloggerLib.dll,WinRT.Runtime.dll,README.txt;
-        dir;
-
-    - uses: "Ceiridge/action-automatic-releases@master" # Actually made by marvinpinto
-      if: ${{ github.event_name == 'push' && endsWith(github.ref, '/master') }} # Don't release on pull requests
-      with:
-        repo_token: ${{ secrets.GITHUB_TOKEN }}
-        automatic_release_tag: latest
-        prerelease: true
-        title: "Prerelease Build"
-        files: |
-          ChromeDevExtWarningPatcher/bin/Release/net6.0-windows10.0.17763.0/ChromeDevExtWarningPatcher.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edge-warning-patcher-7.1.1-release
+          path: |
+            artifacts/edge-warning-patcher-7.1.1-windows-x64.zip
+            artifacts/edge-warning-patcher-7.1.1-source.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error

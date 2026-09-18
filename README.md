@@ -1,99 +1,70 @@
-# Disable Chromium's and Chrome's Developer Mode Extension Warning Popup & Elision WWW/HTTPS Hiding & Debugging Extension Popup
-**Download** it in the [release section](https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher/releases). **The [.NET 6 DESKTOP Runtime](https://dotnet.microsoft.com/download/dotnet/6.0/runtime) is required**.
+# Edge developer-mode extension warning patcher
 
-All patterns and patches auto-update with the `patterns.xml` on every install.\
-Note: It seems like Chrome has completely disabled the warning popup anyway, but this patcher still provides other useful patches.
+[简体中文说明](README.zh-CN.md)
 
-## Supported browsers
-See below for the custom paths (commandline option).
-```javascript
-(✓ represents mostly supported and tested browsers)
-All x64 bit Chromium-based browsers, including:
-- Chrome ✓
-- Chromium ✓
-- Edge ✓
-- Brave ✓
-- Ungoogled Chromium ?
-- Opera ?
-- Yandex Browser
-- Vivaldi
-- Blisk
-- Colibri
-- Epic Browser
-- Iron Browser
+This maintenance branch suppresses only the developer-mode extension startup warning on x64 Edge. The rule was verified on **Microsoft Edge Stable 151.0.4129.59 x64** with this `msedge.dll` SHA-256:
+
+```text
+85A417AAD813BA032FB97B182EB4DB0DD8DC31CA5E5CFBBD6103C26002EBF895
 ```
 
-## Features
+The installed runtime is forward-compatible with Edge 151 and later only while the same complete function signature still matches exactly once and every original write byte is unchanged. An update that changes those safety conditions fails closed without modifying process memory. Later Edge versions are eligible for guarded matching, not claimed as manually validated.
 
-- Intuitive installer GUI
-- Autodetection of browser installations
-- Patcher injector using Event Traces for Windows to minimize cpu usage and to maximize speed
-- Compatibility for Windows 7 - Windows 11
-- SIMD (AVX2) accelerated pattern searching with a fallback for old CPUs
-- Very well documented patterns.xml
-- Easy to compile
+The patch does not disable extensions, Defender SmartScreen, Safe Browsing, permission prompts, extension isolation, signature checks, browser updates, or other security UI. All unrelated legacy patch groups are off by default and the installer rejects any selection other than group 0.
 
-### What can it patch
+## Start with a read-only dry-run
 
-Read the [patterns.xml](https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher/blob/master/patterns.xml) file for more information.
-- Remove extension warning (Removes the warning => main purpose of the patcher)
-- Remove debugging warning (Removes warning when using chrome.debugger in extensions)
-- Disable Elision (Force showing WWW and HTTPS in the url bar/omnibar)
-- Remove crash warning (Remove the "Chromium crashed" popup)
-- Remove send to self (Remove the menu option "Send To Your Devices" when using Google Sync)
-- Remove QR code generation (Remove the context menu option "Create QR code for this page")
-- Enable webRequestBlocking extension API for Manifest V3 extensions
+Install the .NET 9 SDK, then run from the repository root:
 
-## Gui Screenshot
-![Gui Screenshot](https://raw.githubusercontent.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher/master/media/guiscreenshot.png)
-
-## Commandline Options
-All commandline options are **optional** and not required. If none are given, the gui will start. **Warning**: The inferior command line cannot uninstall the entire patcher and if you run it with customPath, all other installations will be removed!
-
-```
-ChromeDevExtWarningPatcher.exe 
-  --groups           Set what patch groups you want to use. See patterns.xml to get the group ids (comma-seperated: 0,1,2,etc.)
-
-  -w, --noWait       Disable the almost-pointless wait after finishing
-
-  --customPath       Instead of automatically detecting and patching all chrome.exe files, define a custom Application-folder path
-                     (see README) (string in quotes is recommended)
-
-  --help             Display this help screen.
-
-  --version          Display version information.
+```powershell
+dotnet build .\EdgeWarningPatcher.Verifier\EdgeWarningPatcher.Verifier.csproj
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-local-edge-fixture.ps1 -NoBuild
 ```
 
-**Recommended `customPath`s:**
-```java
-Chrome (default): "C:\Program Files (x86)\Google\Chrome\Application"
-Brave: "C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application"
-Edge: "C:\Program Files (x86)\Microsoft\Edge\Application"
+The verifier checks the browser and minimum version, module name, x64 PE machine type, `.text` section, complete-function signature, unique match count, and original bytes. It reports the current module SHA-256 and planned RVA/file offsets but opens the Edge module read-only and never writes it.
 
-Remember: The folder of the path always needs to include the latest version folder of the browser (e. g. 83.0.1123.123).
-(Create a new issue with a path, if you want to contribute to this list.)
+To collect a privacy-safe environment report:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\collect-edge-environment.ps1 `
+  -OutputPath .\environment-report.json
 ```
-Find more paths [here](https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher/tree/master/ChromeDevExtWarningPatcher/InstallationFinder/Defaults).
 
-## Contributing
-Clone this repository with `git clone --recursive https://github.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher.git` and open the `.sln` file with Visual Studio 2019 or newer.
+## Reproduce the warning
 
-## Message to Chromium contributors
-This project is not meant for malicious use, especially because patching requires Administrator rights. If an attacker wants to get rid of that notification, they will always be able to do it somehow, since they have access to the computer and to other methods anyway. For example, you could just install a crx-file and allow it with group policies. This makes no sense, because it punishes developers with annoying popups, but crx files that are already packed - and not on the store - can strangely be installed easily.
+Use a disposable Edge profile and [the minimal unpacked extension](test-assets/minimal-unpacked-extension/README.md). Open `edge://extensions`, enable Developer mode, load the fixture, fully exit Edge, confirm all `msedge.exe` processes have ended, and restart Edge.
 
-The idea originates from an answer on StackOverflow that also patched the `chrome.dll` and used to work on old versions.
+## Runtime behavior
 
-Used open source libraries:
-- [dahall/taskscheduler](https://github.com/dahall/taskscheduler)
-- [dahall/Vanara](https://github.com/dahall/Vanara)
-- [MaterialDesignInXAML/MaterialDesignInXamlToolkit](https://github.com/MaterialDesignInXAML/MaterialDesignInXamlToolkit)
-- [commandlineparser/commandline](https://github.com/commandlineparser/commandline)
+The existing installer/injector architecture is retained, but hardened:
 
-## Copyright
-Chrome-Developer-Mode-Extension-Warning-Patcher is released into the public domain according to the GPL 3.0 license by the copyright holders.
+- rules are embedded at build time instead of downloaded at runtime;
+- installation requires the current Edge module to pass the complete read-only verifier before persistence is written;
+- the injected DLL selects exactly one `msedge.dll` below the configured stable Edge application root and checks its version range;
+- the matcher scans only `.text` and requires exactly one match;
+- all original bytes are checked before any in-memory write;
+- writes are applied as one transaction, verified, and rolled back on failure;
+- after an Edge update, the same full validation is repeated against the newly loaded module; compatible code is patched automatically and changed code fails closed.
 
-Disclaimer: This repository and the used names "Chrome", "Chromium", "Edge" in this project are not affiliated with or endorsed by Google LLC, Microsoft, The Chromium Project, Microsoft Edge, Google Chrome or other third parties. This repository and the used names "Chrome", "Chromium", "Edge" are also not affiliated with any existing trademarks.
+The browser binary on disk is not modified. The existing uninstall path removes the scheduled task, injector files, registry registration, and `ChromePatches.bin`; restarting Edge removes the process-memory changes. Because this is an in-memory patch, there is no browser-binary backup to restore.
 
-No code was copied or used from any other browser in this repository. Chromium is licensed under the open source BSD License.
+## Edge updates
 
-This repository does not infringe any copyright of proprietary browsers, as it only patches bytes on the end user's computer, without having any copyright-protected code or text included in this repository.
+Normally the patcher does not need to be run again after an Edge update. Fully restart Edge so the installed injector sees the new main process. If the complete signature still has one match and both original bytes remain valid, the runtime applies the patch automatically. Otherwise the warning returns and `%WINDIR%\Temp\ChromePatcherDllErr.log` records the fail-closed reason; the rule must then be updated before any write is allowed.
+
+## Build and test
+
+See [BUILDING](docs/BUILDING.md). The self-contained verifier test suite uses generated PE fixtures and commits no Microsoft binaries:
+
+```powershell
+dotnet run --project .\EdgeWarningPatcher.Verifier.Tests\EdgeWarningPatcher.Verifier.Tests.csproj
+```
+
+## Evidence and maintenance
+
+- [Edge 151 analysis](docs/EDGE_151_ANALYSIS.md)
+- [Architecture and trust boundaries](docs/ARCHITECTURE.md)
+- [Known limitations](KNOWN_ISSUES.md)
+- [License](LICENSE)
+
+This project is not affiliated with or endorsed by Microsoft, Google, Chromium, or any browser vendor. Edge/Chromium binaries and PDBs are not included.

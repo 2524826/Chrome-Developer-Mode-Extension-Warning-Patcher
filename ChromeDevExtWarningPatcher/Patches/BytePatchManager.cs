@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Net;
 using System.Reflection;
 using System.Threading;
 using System.Windows;
@@ -21,36 +20,10 @@ namespace ChromeDevExtWarningPatcher.Patches {
 			this.BytePatches.Clear();
 			this.bytePatterns.Clear();
 
-			XDocument xmlDoc;
-			string xmlFile =
-#if DEBUG
-				@"..\..\..\..\patterns.xml";
-#else
-				Path.GetTempPath() + "chrome_patcher_patterns.xml";
-#endif
-
-			try {
-#if DEBUG
-				throw new Exception("Forcing to use local patterns.xml");
-#endif
-
-				using WebClient web = new WebClient();
-				ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12; // TLS 1.2, which is required for Github
-
-				string xmlStr;
-				xmlDoc = XDocument.Parse(xmlStr = web.DownloadString("https://raw.githubusercontent.com/Ceiridge/Chrome-Developer-Mode-Extension-Warning-Patcher/master/patterns.xml")); // Hardcoded defaults xml file; This makes quick fixes possible
-
-				File.WriteAllText(xmlFile, xmlStr);
-			} catch (Exception ex) {
-				if (File.Exists(xmlFile)) {
-					xmlDoc = XDocument.Parse(File.ReadAllText(xmlFile));
-					log("An error occurred trying to fetch the new patterns. The old cached version will be used instead. Expect patch errors.\n\n" + ex.Message, "Warning");
-				} else {
-					log("An error occurred trying to fetch the new patterns. The program has to exit, as no cached version of this file has been found.\n\n" + ex.Message, "Error");
-					Environment.Exit(1);
-					return;
-				}
-			}
+			using Stream rulesStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(
+				"ChromeDevExtWarningPatcher.patterns.xml") ??
+				throw new InvalidDataException("Embedded patterns.xml is missing.");
+			XDocument xmlDoc = XDocument.Load(rulesStream, LoadOptions.SetLineInfo);
 
 #nullable disable // Many things could be null here, but a crash would be wanted
 

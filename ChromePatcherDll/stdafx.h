@@ -11,5 +11,11 @@
 #include <thread>
 #include <iomanip>
 #include <immintrin.h>
+#include <algorithm>
+#include <cstring>
+#include <set>
+#include <stdexcept>
+#include <vector>
+#include <cwctype>
 
 inline HMODULE module;

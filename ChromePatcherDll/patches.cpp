@@ -1,267 +1,490 @@
 #include "stdafx.h"
 #include "patches.hpp"
-#include "simplepatternsearcher.hpp"
-#include "simdpatternsearcher.hpp"
-#include "threads.hpp"
-
-#define ReadVar(variable) file.read(reinterpret_cast<char*>(&variable), sizeof(variable)); // Makes everything easier to read
 
 namespace ChromePatch {
-	std::ostream& operator<<(std::ostream& os, const Patch& patch) { // Write identifiable data to the output stream for debugging
-		const PatchPattern& firstPattern = patch.patterns[0];
+	namespace {
+		constexpr unsigned int FileHeader = 0xCE161D6F;
+		constexpr unsigned int PatchHeader = 0x8A7C5000;
+		constexpr int MaximumPatches = 64;
+		constexpr int MaximumPatterns = 32;
+		constexpr int MaximumPatternLength = 4096;
+		constexpr int MaximumOffsets = 64;
+		constexpr int MaximumNewBytes = 4096;
 
-		os << "(First Pattern: " << std::hex;
-		for (byte b : firstPattern.pattern) {
-			os << std::setw(2) << std::setfill('0') << (int)b << " ";
+		template<typename T>
+		T ReadValue(std::ifstream& file, const char* field) {
+			T value{};
+			if (!file.read(reinterpret_cast<char*>(&value), sizeof(value))) {
+				throw std::runtime_error(std::string("Truncated ChromePatches.bin while reading ") + field);
+			}
+			return value;
 		}
 
+		int ReadCount(std::ifstream& file, int maximum, const char* field) {
+			const int value = ReadValue<int>(file, field);
+			if (value < 0 || value > maximum) {
+				throw std::runtime_error(std::string("Invalid count for ") + field);
+			}
+			return value;
+		}
+
+		struct PlannedWrite {
+			Patch* patch;
+			byte* address;
+			byte original;
+			byte replacement;
+			DWORD originalProtection{};
+		};
+
+		bool IsInside(const byte* address, size_t length, const byte* start, size_t size) {
+			return address >= start && length <= size &&
+				static_cast<size_t>(address - start) <= size - length;
+		}
+
+		bool MatchesAt(const PatchPattern& pattern, const byte* address) {
+			for (size_t index = 0; index < pattern.pattern.size(); index++) {
+				const byte expected = pattern.pattern[index];
+				if (expected != 0xFF && address[index] != expected) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		bool SamePatterns(const std::vector<PatchPattern>& left, const std::vector<PatchPattern>& right) {
+			if (left.size() != right.size()) {
+				return false;
+			}
+			for (size_t index = 0; index < left.size(); index++) {
+				if (left[index].pattern != right[index].pattern) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		std::set<byte*> FindPatternMatches(const std::vector<PatchPattern>& patterns,
+			byte* textStart, size_t textSize) {
+			std::set<byte*> matches;
+			for (const PatchPattern& pattern : patterns) {
+				if (pattern.pattern.empty() || pattern.pattern.size() > textSize) {
+					throw std::runtime_error("A patch contains an invalid pattern length");
+				}
+
+				auto anchor = std::find_if(pattern.pattern.begin(), pattern.pattern.end(),
+					[](byte value) { return value != 0xFF; });
+				if (anchor == pattern.pattern.end()) {
+					throw std::runtime_error("A patch pattern contains only wildcards");
+				}
+				const size_t anchorOffset = static_cast<size_t>(anchor - pattern.pattern.begin());
+				byte* firstAnchor = textStart + anchorOffset;
+				byte* lastAnchor = textStart + textSize - pattern.pattern.size() + anchorOffset;
+				byte* cursor = firstAnchor;
+				while (cursor <= lastAnchor) {
+					const size_t remaining = static_cast<size_t>(lastAnchor - cursor) + 1;
+					byte* found = static_cast<byte*>(std::memchr(cursor, *anchor, remaining));
+					if (found == nullptr) {
+						break;
+					}
+					byte* candidate = found - anchorOffset;
+					if (MatchesAt(pattern, candidate)) {
+						matches.insert(candidate);
+					}
+					cursor = found + 1;
+				}
+			}
+			return matches;
+		}
+
+		std::wstring TrimTrailingSeparators(std::wstring path) {
+			while (path.size() > 3 && (path.back() == L'\\' || path.back() == L'/')) {
+				path.pop_back();
+			}
+			return path;
+		}
+
+		std::wstring ParentPath(const std::wstring& path) {
+			const std::wstring trimmed = TrimTrailingSeparators(path);
+			const size_t separator = trimmed.find_last_of(L"\\/");
+			return separator == std::wstring::npos ? std::wstring() : trimmed.substr(0, separator);
+		}
+
+		std::wstring FileName(const std::wstring& path) {
+			const std::wstring trimmed = TrimTrailingSeparators(path);
+			const size_t separator = trimmed.find_last_of(L"\\/");
+			return separator == std::wstring::npos ? trimmed : trimmed.substr(separator + 1);
+		}
+
+		bool TryParseVersion(const std::wstring& text, std::vector<unsigned long>& parts) {
+			parts.clear();
+			if (text.empty()) {
+				return false;
+			}
+			size_t start = 0;
+			while (start < text.size()) {
+				const size_t end = text.find(L'.', start);
+				const size_t length = (end == std::wstring::npos ? text.size() : end) - start;
+				if (length == 0 || length > 10) {
+					return false;
+				}
+				unsigned long value = 0;
+				for (size_t index = start; index < start + length; index++) {
+					if (!iswdigit(text[index])) {
+						return false;
+					}
+					const unsigned long digit = static_cast<unsigned long>(text[index] - L'0');
+					if (value > (ULONG_MAX - digit) / 10) {
+						return false;
+					}
+					value = value * 10 + digit;
+				}
+				parts.push_back(value);
+				if (end == std::wstring::npos) {
+					break;
+				}
+				start = end + 1;
+			}
+			return !parts.empty();
+		}
+
+		int CompareVersions(std::vector<unsigned long> left, std::vector<unsigned long> right) {
+			const size_t length = (std::max)(left.size(), right.size());
+			left.resize(length);
+			right.resize(length);
+			for (size_t index = 0; index < length; index++) {
+				if (left[index] < right[index]) return -1;
+				if (left[index] > right[index]) return 1;
+			}
+			return 0;
+		}
+
+		bool VersionInRange(const std::wstring& actualText, const std::wstring& minimumText,
+			const std::wstring& maximumText) {
+			std::vector<unsigned long> actual;
+			std::vector<unsigned long> minimum;
+			if (!TryParseVersion(actualText, actual) || !TryParseVersion(minimumText, minimum) ||
+				CompareVersions(actual, minimum) < 0) {
+				return false;
+			}
+			if (maximumText == L"*") {
+				return true;
+			}
+			std::vector<unsigned long> maximum;
+			return TryParseVersion(maximumText, maximum) && CompareVersions(actual, maximum) <= 0;
+		}
+
+		bool IsCandidateModulePathCore(const std::wstring& applicationRoot,
+			const std::wstring& moduleName, const std::wstring& minimumVersion,
+			const std::wstring& maximumVersion, const std::wstring& path,
+			std::wstring* version) {
+			if (applicationRoot.empty() || moduleName.empty() ||
+				_wcsicmp(FileName(path).c_str(), moduleName.c_str()) != 0) {
+				return false;
+			}
+			const std::wstring versionDirectory = ParentPath(path);
+			const std::wstring candidateRoot = TrimTrailingSeparators(ParentPath(versionDirectory));
+			const std::wstring candidateVersion = FileName(versionDirectory);
+			if (_wcsicmp(candidateRoot.c_str(), TrimTrailingSeparators(applicationRoot).c_str()) != 0 ||
+				!VersionInRange(candidateVersion, minimumVersion, maximumVersion)) {
+				return false;
+			}
+			if (version != nullptr) {
+				*version = candidateVersion;
+			}
+			return true;
+		}
+	}
+
+	bool ModuleSelector::IsCandidate(const wchar_t* applicationRoot, const wchar_t* moduleName,
+		const wchar_t* minimumVersion, const wchar_t* maximumVersion, const wchar_t* path) {
+		return applicationRoot != nullptr && moduleName != nullptr && minimumVersion != nullptr &&
+			maximumVersion != nullptr && path != nullptr && IsCandidateModulePathCore(
+				applicationRoot, moduleName, minimumVersion, maximumVersion, path, nullptr);
+	}
+
+	std::ostream& operator<<(std::ostream& os, const Patch& patch) {
+		os << "(First Pattern: " << std::hex;
+		if (!patch.patterns.empty()) {
+			for (byte value : patch.patterns[0].pattern) {
+				os << std::setw(2) << std::setfill('0') << static_cast<int>(value) << " ";
+			}
+		}
 		os << "with PatchByte " << static_cast<int>(patch.patchByte) << ")" << std::dec;
 		return os;
 	}
 
-
-	ReadPatchResult Patches::ReadPatchFile() {
-		static const unsigned int FILE_HEADER = 0xCE161D6E; // Magic values
-		static const unsigned int PATCH_HEADER = 0x8A7C5000;
+	ReadPatchResult Patches::ReadPatchFile(const std::wstring& browserExePath) {
 		ReadPatchResult result{};
+		patches.clear();
+		applicationRoot.clear();
+		moduleName.clear();
+		minimumVersion.clear();
+		maximumVersion.clear();
+		ruleId.clear();
 
-		bool firstFile = true;
-	RETRY_FILE_LABEL:
-		std::ifstream file(firstFile ? "ChromePatches.bin" : "..\\ChromePatches.bin", std::ios::binary);
-		file.unsetf(std::ios::skipws); // Disable skipping of leading whitespaces while reading
-
+		const std::wstring browserRoot = TrimTrailingSeparators(ParentPath(browserExePath));
+		const std::wstring patchFilePath = browserRoot + L"\\ChromePatches.bin";
+		std::ifstream file(patchFilePath, std::ios::binary);
 		if (!file.good()) {
-			if (firstFile) {
-				firstFile = false;
-				goto RETRY_FILE_LABEL; // Retry once if the file was not found
+			throw std::runtime_error("ChromePatches.bin was not found beside the browser executable");
+		}
+
+		if (ReadUInteger(file) != FileHeader) {
+			throw std::runtime_error("Unsupported ChromePatches.bin format; reinstall the forward-compatible patcher");
+		}
+		applicationRoot = TrimTrailingSeparators(MultibyteToWide(ReadString(file)));
+		moduleName = MultibyteToWide(ReadString(file));
+		minimumVersion = MultibyteToWide(ReadString(file));
+		maximumVersion = MultibyteToWide(ReadString(file));
+		ruleId = ReadString(file);
+		if (applicationRoot.empty() || moduleName.empty() || minimumVersion.empty() ||
+			maximumVersion.empty() || ruleId.empty()) {
+			throw std::runtime_error("ChromePatches.bin contains an empty module selector field");
+		}
+		if (_wcsicmp(applicationRoot.c_str(), browserRoot.c_str()) != 0 ||
+			_wcsicmp(moduleName.c_str(), L"msedge.dll") != 0 ||
+			FileName(moduleName) != moduleName) {
+			throw std::runtime_error("ChromePatches.bin module selector does not match this Edge installation");
+		}
+		std::vector<unsigned long> minimumParts;
+		std::vector<unsigned long> maximumParts;
+		if (!TryParseVersion(minimumVersion, minimumParts) ||
+			(maximumVersion != L"*" && !TryParseVersion(maximumVersion, maximumParts))) {
+			throw std::runtime_error("ChromePatches.bin contains an invalid version range");
+		}
+
+		int patchCount = 0;
+		while (file.peek() != EOF) {
+			if (++patchCount > MaximumPatches) {
+				throw std::runtime_error("ChromePatches.bin contains too many patches");
 			}
-
-			throw std::exception("ChromePatches.bin file not found or not accessible");
-		}
-
-		unsigned int header = ReadUInteger(file);
-		if (header != FILE_HEADER) {
-			throw std::runtime_error("Invalid file: Wrong header " + std::to_string(header));
-		}
-
-		std::wstring dllPath = MultibyteToWide(ReadString(file));
-		if (dllPath != chromeDllPath) {
-			result.UsingWrongVersion = true;
-		}
-
-		while (file.peek() != EOF) { // For each patch
-			unsigned int patchHeader = ReadUInteger(file);
-			if (patchHeader != PATCH_HEADER) {
-				throw std::runtime_error("Invalid file: Wrong patch header " + std::to_string(patchHeader));
+			if (ReadUInteger(file) != PatchHeader) {
+				throw std::runtime_error("Invalid ChromePatches.bin patch header");
 			}
 
 			std::vector<PatchPattern> patterns;
-			int patternsSize;
-			ReadVar(patternsSize);
-			for (int i = 0; i < patternsSize; i++) { // For each pattern, read its values
-				int patternLength;
-				ReadVar(patternLength);
-				std::vector<byte> pattern;
-
-				for (int i = 0; i < patternLength; i++) {
-					byte patternByte;
-					ReadVar(patternByte);
-					pattern.push_back(patternByte);
+			const int patternsSize = ReadCount(file, MaximumPatterns, "pattern count");
+			if (patternsSize == 0) {
+				throw std::runtime_error("Patch has no patterns");
+			}
+			for (int patternIndex = 0; patternIndex < patternsSize; patternIndex++) {
+				const int patternLength = ReadCount(file, MaximumPatternLength, "pattern length");
+				if (patternLength == 0) {
+					throw std::runtime_error("Patch has an empty pattern");
 				}
-
+				std::vector<byte> pattern(static_cast<size_t>(patternLength));
+				if (!file.read(reinterpret_cast<char*>(pattern.data()), pattern.size())) {
+					throw std::runtime_error("Truncated ChromePatches.bin pattern");
+				}
 				patterns.push_back(PatchPattern{ pattern });
 			}
 
-			int offsetCount; // Read the Offsets list
-			ReadVar(offsetCount);
 			std::vector<int> offsets;
-			for (int i = 0; i < offsetCount; i++) {
-				int offset;
-				ReadVar(offset);
-				offsets.push_back(offset);
+			const int offsetCount = ReadCount(file, MaximumOffsets, "offset count");
+			if (offsetCount == 0) {
+				throw std::runtime_error("Patch has no offsets");
+			}
+			for (int offsetIndex = 0; offsetIndex < offsetCount; offsetIndex++) {
+				offsets.push_back(ReadValue<int>(file, "patch offset"));
 			}
 
-			int newBytesCount; // Read the NewBytes array
-			ReadVar(newBytesCount);
-			std::vector<byte> newBytes;
-			for(int i = 0; i < newBytesCount; i++) {
-				byte newByte;
-				ReadVar(newByte);
-				newBytes.push_back(newByte);
+			const int newBytesCount = ReadCount(file, MaximumNewBytes, "new byte count");
+			std::vector<byte> newBytes(static_cast<size_t>(newBytesCount));
+			if (newBytesCount > 0 &&
+				!file.read(reinterpret_cast<char*>(newBytes.data()), newBytes.size())) {
+				throw std::runtime_error("Truncated ChromePatches.bin replacement bytes");
 			}
 
-			int sigOffset; // Read the rest of the data
-			byte origByte, patchByte, isSig;
-			ReadVar(origByte);
-			ReadVar(patchByte);
-			ReadVar(isSig);
-			ReadVar(sigOffset);
+			const byte origByte = ReadValue<byte>(file, "original byte");
+			const byte patchByte = ReadValue<byte>(file, "replacement byte");
+			const byte isSig = ReadValue<byte>(file, "signature flag");
+			const int sigOffset = ReadValue<int>(file, "signature offset");
+			if (isSig > 1) {
+				throw std::runtime_error("Invalid signature flag");
+			}
 
 			Patch patch{ patterns, origByte, patchByte, offsets, newBytes, isSig > 0, sigOffset };
 			patches.push_back(patch);
-			
 			std::cout << "Loaded patch: " << patch << std::endl;
 		}
-
-		file.close();
+		if (patches.empty()) {
+			throw std::runtime_error("ChromePatches.bin contains no enabled patches");
+		}
 		return result;
 	}
 
-	// Convert a UTF8 string to a UTF16LE string
+	bool Patches::IsCandidateModulePath(const std::wstring& path, std::wstring* version) const {
+		return IsCandidateModulePathCore(applicationRoot, moduleName, minimumVersion,
+			maximumVersion, path, version);
+	}
+
 	std::wstring Patches::MultibyteToWide(const std::string& str) {
 		if (str.empty()) {
 			return std::wstring();
 		}
-
-		const size_t len = MultiByteToWideChar(CP_UTF8, NULL, str.c_str(), str.length(), nullptr, 0);
-		std::wstring result(len, '\0');
-
-		if (len > 0) {
-			if (MultiByteToWideChar(CP_UTF8, NULL, str.c_str(), str.length(), result.data(), len)) {
-				return result;
-			}
+		const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(),
+			static_cast<int>(str.length()), nullptr, 0);
+		if (length <= 0) {
+			throw std::runtime_error("ChromePatches.bin module path is not valid UTF-8");
 		}
-
-		return std::wstring();
+		std::wstring result(static_cast<size_t>(length), L'\0');
+		if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, str.c_str(),
+			static_cast<int>(str.length()), result.data(), length)) {
+			throw std::runtime_error("ChromePatches.bin module path conversion failed");
+		}
+		return result;
 	}
 
 	std::string Patches::ReadString(std::ifstream& file) {
-		int length;
-		ReadVar(length);
-
-		std::string str(length, '\0');
-		file.read(str.data(), length);
-		return str;
+		const int length = ReadCount(file, 32768, "string length");
+		std::string value(static_cast<size_t>(length), '\0');
+		if (length > 0 && !file.read(value.data(), value.size())) {
+			throw std::runtime_error("Truncated ChromePatches.bin string");
+		}
+		return value;
 	}
 
 	unsigned int Patches::ReadUInteger(std::ifstream& file) {
-		unsigned int integer;
-		ReadVar(integer);
-
-		return _byteswap_ulong(integer); // Convert to Big Endian (for the magic values)
+		return _byteswap_ulong(ReadValue<unsigned int>(file, "header"));
 	}
-
 
 	int Patches::ApplyPatches() {
-		std::unique_ptr<PatternSearcher> patternSearcher;
-		const bool simdCpuSupport = SimdPatternSearcher::IsCpuSupported();
-		std::cout << "SIMD support: " << simdCpuSupport << std::endl;
-		
-		if(simdCpuSupport) {
-			patternSearcher = std::make_unique<SimdPatternSearcher>();
-		} else {
-			patternSearcher = std::make_unique<SimplePatternSearcher>();
+		if (chromeDll == nullptr || !IsCandidateModulePath(chromeDllPath)) {
+			throw std::runtime_error("Target module does not satisfy the configured Edge root, name, or version range");
 		}
-		
-		int successfulPatches = 0;
-		std::vector<std::thread> patchThreads;
-		std::cout << "Applying patches, please wait..." << std::endl;
-		const HANDLE proc = GetCurrentProcess();
-		MODULEINFO chromeDllInfo;
 
-		GetModuleInformation(proc, chromeDll, &chromeDllInfo, sizeof(chromeDllInfo));
-		MEMORY_BASIC_INFORMATION mbi{};
+		byte* imageBase = reinterpret_cast<byte*>(chromeDll);
+		const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase);
+		if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) {
+			throw std::runtime_error("Target module has an invalid DOS header");
+		}
+		const IMAGE_NT_HEADERS64* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(imageBase + dos->e_lfanew);
+		if (nt->Signature != IMAGE_NT_SIGNATURE || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+			nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+			throw std::runtime_error("Target module is not a valid x64 PE image");
+		}
 
-		for (uintptr_t i = (uintptr_t)chromeDll; i < (uintptr_t)chromeDll + (uintptr_t)chromeDllInfo.SizeOfImage; i++) {
-			if (VirtualQuery((LPCVOID)i, &mbi, sizeof(mbi))) {
-				if (mbi.Protect & (PAGE_GUARD | PAGE_NOCACHE | PAGE_NOACCESS) || !(mbi.State & MEM_COMMIT) || !(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE))) {
-					i += mbi.RegionSize; // Skip these regions
-				} else {
-					for (Patch& patch : patches) {
-						if (patch.finishedPatch) {
-							continue;
-						}
-
-						std::thread patchThread(PatchThreadDelegate, &patch, patternSearcher.get(), &mbi);
-						patchThreads.push_back(std::move(patchThread));
-					}
-
-					for (std::thread& patchThread : patchThreads) { // Make sure all threads have executed in this memory region
-						// I cannot use patchThread.join here, because it causes deadlocks
-						HANDLE patchHandle = patchThread.native_handle();
-						const time_t waitTime = std::time(nullptr);
-						bool hasNoticedTimeout = false;
-						
-						while(WaitForSingleObject(patchHandle, 0) != WAIT_OBJECT_0) {
-							// Active waiting required to prevent deadlocks
-
-							if(hasNoticedTimeout) {
-								continue;
-							}
-							
-							if(waitTime + (simdCpuSupport ? 1 : 5) < std::time(nullptr)) { // 1 or 5 seconds timeout
-								std::cout << "Patch Thread " << patchHandle << " timeouted! Resuming all other threads. (This is a race condition now)" << std::endl;
-								ResumeOtherThreads();
-								hasNoticedTimeout = true;
-							}
-						}
-
-						patchThread.detach();
-					}
-					patchThreads.clear();
-					
-					i = (uintptr_t)mbi.BaseAddress + mbi.RegionSize; // Skip to the next region after this one has been searched
+		const IMAGE_SECTION_HEADER* textHeader = nullptr;
+		const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
+		for (WORD index = 0; index < nt->FileHeader.NumberOfSections; index++) {
+			char name[IMAGE_SIZEOF_SHORT_NAME + 1]{};
+			memcpy_s(name, sizeof(name), sections[index].Name, IMAGE_SIZEOF_SHORT_NAME);
+			if (strcmp(name, ".text") == 0) {
+				if (textHeader != nullptr) {
+					throw std::runtime_error("Target module contains duplicate .text sections");
 				}
+				textHeader = &sections[index];
 			}
 		}
-		
+		if (textHeader == nullptr) {
+			throw std::runtime_error("Target module has no .text section");
+		}
+
+		byte* textStart = imageBase + textHeader->VirtualAddress;
+		const size_t textSize = textHeader->Misc.VirtualSize;
+		if (textSize == 0 || textHeader->VirtualAddress >= nt->OptionalHeader.SizeOfImage ||
+			textSize > nt->OptionalHeader.SizeOfImage - textHeader->VirtualAddress) {
+			throw std::runtime_error("Target .text section is outside the image");
+		}
+
+		struct CachedMatches {
+			const std::vector<PatchPattern>* patterns;
+			std::set<byte*> matches;
+		};
+		std::vector<CachedMatches> matchCache;
+		std::vector<PlannedWrite> plan;
 		for (Patch& patch : patches) {
-			if (!patch.successfulPatch) {
-				std::cerr << "Couldn't patch " << patch << std::endl;
-			} else {
-				successfulPatches++;
+			if (patch.origByte == 0xFF) {
+				throw std::runtime_error("A patch uses wildcard original bytes; refusing all writes");
 			}
+			if (!patch.newBytes.empty()) {
+				throw std::runtime_error("A multi-byte patch has no complete expected-byte sequence; refusing all writes");
+			}
+
+			auto cached = std::find_if(matchCache.begin(), matchCache.end(), [&patch](const CachedMatches& entry) {
+				return SamePatterns(*entry.patterns, patch.patterns);
+			});
+			if (cached == matchCache.end()) {
+				matchCache.push_back(CachedMatches{ &patch.patterns,
+					FindPatternMatches(patch.patterns, textStart, textSize) });
+				cached = matchCache.end() - 1;
+			}
+			const std::set<byte*>& matches = cached->matches;
+			if (matches.size() != 1) {
+				throw std::runtime_error("Rule " + ruleId + " expected exactly one .text match, found " +
+					std::to_string(matches.size()) + "; refusing all writes");
+			}
+
+			byte* match = *matches.begin();
+			std::vector<byte*> candidates;
+			for (int offset : patch.offsets) {
+				if (offset < 0 || !IsInside(match, static_cast<size_t>(offset) + 1, textStart, textSize)) {
+					continue;
+				}
+				byte* address = match + offset;
+				if (patch.isSig) {
+					if (!IsInside(address, sizeof(int), textStart, textSize)) {
+						continue;
+					}
+					const int displacement = *reinterpret_cast<const int*>(address);
+					const intptr_t destination = reinterpret_cast<intptr_t>(address) +
+						static_cast<intptr_t>(displacement) + sizeof(int) + patch.sigOffset;
+					address = reinterpret_cast<byte*>(destination);
+				}
+				if (IsInside(address, 1, textStart, textSize) && *address == patch.origByte) {
+					candidates.push_back(address);
+				}
+			}
+			std::sort(candidates.begin(), candidates.end());
+			candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+			if (candidates.size() != 1) {
+				throw std::runtime_error("Rule " + ruleId +
+					" did not find the expected original byte at exactly one write offset; refusing all writes");
+			}
+
+			for (const PlannedWrite& existing : plan) {
+				if (existing.address == candidates[0]) {
+					throw std::runtime_error("Patch plan contains overlapping writes; refusing all writes");
+				}
+			}
+			plan.push_back(PlannedWrite{ &patch, candidates[0], patch.origByte, patch.patchByte });
 		}
 
-		CloseHandle(proc);
-		return successfulPatches;
+		std::vector<PlannedWrite*> applied;
+		for (PlannedWrite& write : plan) {
+			if (!VirtualProtect(write.address, 1, PAGE_EXECUTE_READWRITE, &write.originalProtection)) {
+				break;
+			}
+			*write.address = write.replacement;
+			applied.push_back(&write);
+			const BOOL flushed = FlushInstructionCache(GetCurrentProcess(), write.address, 1);
+			DWORD ignored{};
+			const BOOL restored = VirtualProtect(write.address, 1, write.originalProtection, &ignored);
+			if (!flushed || !restored || *write.address != write.replacement) {
+				break;
+			}
+			write.patch->successfulPatch = true;
+		}
+
+		if (applied.size() != plan.size() ||
+			std::any_of(plan.begin(), plan.end(), [](const PlannedWrite& write) { return !write.patch->successfulPatch; })) {
+			std::cerr << "A write failed; rolling back the complete patch plan" << std::endl;
+			for (auto iterator = applied.rbegin(); iterator != applied.rend(); ++iterator) {
+				PlannedWrite* write = *iterator;
+				DWORD currentProtection{};
+				if (VirtualProtect(write->address, 1, PAGE_EXECUTE_READWRITE, &currentProtection)) {
+					*write->address = write->original;
+					FlushInstructionCache(GetCurrentProcess(), write->address, 1);
+					DWORD ignored{};
+					VirtualProtect(write->address, 1, write->originalProtection, &ignored);
+				}
+				write->patch->successfulPatch = false;
+			}
+			return 0;
+		}
+
+		std::cout << "Rule " << ruleId << " applied " << plan.size()
+			<< " guarded patch write(s) transactionally" << std::endl;
+		return static_cast<int>(plan.size());
 	}
-
-	void Patches::PatchThreadDelegate(Patch* patch, PatternSearcher* patternSearcher, MEMORY_BASIC_INFORMATION* mbi) {
-		byte* searchResult = patternSearcher->SearchBytePattern(*patch, static_cast<byte*>(mbi->BaseAddress), mbi->RegionSize);
-		if (!searchResult) { // is null
-			return;
-		}
-
-		int offsetAttempt = 0;
-		while (!patch->successfulPatch) {
-			byte* patchAddr = searchResult + patch->offsets[offsetAttempt];
-			std::cout << "Reading address " << std::hex << (uintptr_t)patchAddr << std::endl;
-
-			if (patch->isSig) { // Add the offset found at the patchAddr (with a 4 byte rel. addr. offset) to the patchAddr
-				patchAddr += *reinterpret_cast<int*>(patchAddr) + 4 + patch->sigOffset;
-				std::cout << "New aftersig address: " << std::hex << (uintptr_t)patchAddr << std::endl;
-			}
-
-			if (patch->origByte == 0xFF || *patchAddr == patch->origByte) {
-				std::cout << "Patching byte " << std::hex << (int)*patchAddr << " to " << (int)patch->patchByte << " at " << (uintptr_t)patchAddr << std::endl;
-				DWORD oldProtect;
-				VirtualProtect(mbi->BaseAddress, mbi->RegionSize, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-				if (patch->newBytes.empty()) { // Patch a single byte
-					*patchAddr = patch->patchByte;
-				}
-				else { // Write the newBytes array if it is filled instead
-					const size_t newBytesSize = patch->newBytes.size();
-					memcpy_s(patchAddr, newBytesSize, patch->newBytes.data(), newBytesSize);
-
-					std::cout << newBytesSize << " NewBytes have been written" << std::endl;
-				}
-
-				VirtualProtect(mbi->BaseAddress, mbi->RegionSize, oldProtect, &oldProtect);
-				patch->successfulPatch = true;
-			}
-			else {
-				offsetAttempt++;
-				std::cerr << "Byte (" << std::hex << (int)*patchAddr << ") not original (" << (int)patch->origByte << ") at " << (uintptr_t)patchAddr << std::endl;
-
-				if (offsetAttempt == patch->offsets.size()) {
-					break; // Abort trying out offsets if none worked
-				}
-			}
-		}
-
-		patch->finishedPatch = true;
-	}
-
 }

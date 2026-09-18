@@ -2,12 +2,28 @@
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
 using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Vanara.PInvoke;
 
 namespace ChromeDllInjector.ProcessListeners {
 	public class EtwListener : IProcessListener {
+		private const int FastFlushMilliseconds = 5;
+		private const int IdleFlushMilliseconds = 50;
+		private const int RecentInputWindowMilliseconds = 2000;
+		private static readonly TimeSpan StartupFastWindow = TimeSpan.FromMinutes(3);
 		private Action<int> processCallback;
+
+		[StructLayout(LayoutKind.Sequential)]
+		private struct LASTINPUTINFO {
+			public uint cbSize;
+			public uint dwTime;
+		}
+
+		[DllImport("user32.dll")]
+		[return: MarshalAs(UnmanagedType.Bool)]
+		private static extern bool GetLastInputInfo(ref LASTINPUTINFO inputInfo);
 
 		public void StartListener(Action<int> callback) {
 			this.processCallback = callback;
@@ -17,7 +33,7 @@ namespace ChromeDllInjector.ProcessListeners {
 			kernelSession.Source.Kernel.ProcessStart += this.Kernel_ProcessStart;
 
 			new Thread(() => { // Required because of blocking Process() below
-				Thread.Sleep(10); // Wait a bit to make sure the ETW started processing
+				Stopwatch uptime = Stopwatch.StartNew();
 
 				AdvApi32.EVENT_TRACE_PROPERTIES properties = new AdvApi32.EVENT_TRACE_PROPERTIES {
 					Wnode = new AdvApi32.WNODE_HEADER {
@@ -29,15 +45,25 @@ namespace ChromeDllInjector.ProcessListeners {
 				Console.WriteLine("Flush thread started: " + properties.Wnode.Guid);
 
 				while (true) {
-					Thread.Sleep(50); // Flush the ETW buffer every 50ms to be faster than Chromium starting up; The default flush timer is set to 1s (=> too slow)
+					bool fastFlush = uptime.Elapsed < StartupFastWindow || WasInputReceivedRecently();
+					Thread.Sleep(fastFlush ? FastFlushMilliseconds : IdleFlushMilliseconds);
 					try {
 						AdvApi32.FlushTrace(0 /* NULL Handle */, kernelSession.SessionName, ref properties);
 					} catch (Exception) { }
 				}
 			}).Start();
 
-			Console.WriteLine("Starting to process");
+			Console.WriteLine("Starting to process; ETW flush interval is 5 ms during startup/recent input and 50 ms while idle");
 			kernelSession.Source.Process(); // Blocking forever
+		}
+
+		private static bool WasInputReceivedRecently() {
+			LASTINPUTINFO inputInfo = new LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf<LASTINPUTINFO>() };
+			if (!GetLastInputInfo(ref inputInfo)) {
+				return false;
+			}
+			uint elapsed = unchecked((uint)Environment.TickCount - inputInfo.dwTime);
+			return elapsed <= RecentInputWindowMilliseconds;
 		}
 
 		private void Kernel_ProcessStart(ProcessTraceData obj) {

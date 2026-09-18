@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using Vanara.Extensions;
@@ -12,40 +12,38 @@ namespace ChromeDllInjector {
 			this.dllPath = dllPath;
 		}
 
-		// Inject the dll with by creating a remote thread on LoadLibraryW
-		public void Inject(Process p) {
-			Kernel32.SafeHPROCESS proc = Kernel32.OpenProcess(new ACCESS_MASK(Kernel32.ProcessAccess.PROCESS_ALL_ACCESS), false, (uint)p.Id);
-
-			if (!proc.IsNull && !proc.IsInvalid) {
-				IntPtr loadLib = Kernel32.GetProcAddress(Kernel32.LoadLibrary("kernel32.dll"), "LoadLibraryW");
-				if (loadLib == IntPtr.Zero) {
-					Console.WriteLine("LoadLibaryW not found");
-					return;
-				}
-
-				byte[] dllPathBytes = this.dllPath.GetBytes(true, CharSet.Unicode); // Unicode for wide chars
-				IntPtr alloc = Kernel32.VirtualAllocEx(proc, IntPtr.Zero, dllPathBytes.Length, Kernel32.MEM_ALLOCATION_TYPE.MEM_COMMIT, Kernel32.MEM_PROTECTION.PAGE_EXECUTE_READWRITE);
-				if (alloc == IntPtr.Zero) {
-					Console.WriteLine("Couldn't allocate");
-					return;
-				}
-				if (!Kernel32.WriteProcessMemory(proc, alloc, dllPathBytes, dllPathBytes.Length, out _)) {
-					Console.WriteLine("Couldn't write " + Kernel32.GetLastError());
-					return;
-				}
-
-				Kernel32.SafeHTHREAD thread = Kernel32.CreateRemoteThread(proc, null, 0, loadLib, alloc, 0, out _);
-				if (!thread.IsNull && !thread.IsInvalid) {
-					Console.WriteLine("Injected!");
-
-					Kernel32.WaitForSingleObject(thread, Kernel32.INFINITE); // Wait until the dll is injected, so the path can be freed later
-					thread.Close();
-				}
-
-				Kernel32.VirtualFreeEx(proc, alloc, 0, Kernel32.MEM_ALLOCATION_TYPE.MEM_RELEASE); // Free path from the target's memory (alloc's existence is ensured above)
+		public void Inject(Process process) {
+			Kernel32.SafeHPROCESS target = Kernel32.OpenProcess(new ACCESS_MASK(Kernel32.ProcessAccess.PROCESS_ALL_ACCESS), false, (uint)process.Id);
+			if (target.IsNull || target.IsInvalid) {
+				return;
 			}
 
-			proc.Close();
+			IntPtr allocation = IntPtr.Zero;
+			try {
+				IntPtr loadLibrary = Kernel32.GetProcAddress(Kernel32.LoadLibrary("kernel32.dll"), "LoadLibraryW");
+				if (loadLibrary == IntPtr.Zero) {
+					return;
+				}
+
+				byte[] dllPathBytes = dllPath.GetBytes(true, CharSet.Unicode);
+				allocation = Kernel32.VirtualAllocEx(target, IntPtr.Zero, dllPathBytes.Length, Kernel32.MEM_ALLOCATION_TYPE.MEM_COMMIT, Kernel32.MEM_PROTECTION.PAGE_EXECUTE_READWRITE);
+				if (allocation == IntPtr.Zero || !Kernel32.WriteProcessMemory(target, allocation, dllPathBytes, dllPathBytes.Length, out _)) {
+					return;
+				}
+
+				Kernel32.SafeHTHREAD thread = Kernel32.CreateRemoteThread(target, null, 0, loadLibrary, allocation, 0, out _);
+				if (thread.IsNull || thread.IsInvalid) {
+					return;
+				}
+
+				Kernel32.WaitForSingleObject(thread, Kernel32.INFINITE);
+				thread.Close();
+			} finally {
+				if (allocation != IntPtr.Zero) {
+					Kernel32.VirtualFreeEx(target, allocation, 0, Kernel32.MEM_ALLOCATION_TYPE.MEM_RELEASE);
+				}
+				target.Close();
+			}
 		}
 	}
 }

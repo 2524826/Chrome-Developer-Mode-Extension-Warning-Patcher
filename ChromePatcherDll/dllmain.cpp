@@ -90,33 +90,61 @@ BOOL APIENTRY ThreadMain(LPVOID lpModule) {
 	}
 
 	HANDLE proc = GetCurrentProcess();
+	try {
+		ChromePatch::patches.ReadPatchFile(exePath);
+		std::cout << "Loaded forward-compatible rule: " << ChromePatch::patches.ruleId << std::endl;
+		std::wcout << L"Target selector: " << ChromePatch::patches.applicationRoot << L"\\<"
+			<< ChromePatch::patches.minimumVersion << L".." << ChromePatch::patches.maximumVersion
+			<< L">\\" << ChromePatch::patches.moduleName << std::endl;
+	}
+	catch (const std::exception& ex) {
+		std::cerr << "Patch configuration rejected: " << ex.what() << std::endl;
+		if (fout != nullptr)
+			fclose(fout);
+		if (ferr != nullptr)
+			fclose(ferr);
+		return TRUE;
+	}
 
 	bool hasFoundChrome = false;
+	bool selectorRejected = false;
 	int attempts = 0;
-	std::wregex chromeDllRegex(L"\\\\Application\\\\(?:\\d+?\\.?)+\\\\[a-zA-Z0-9-]+\\.dll");
 
-	while (!hasFoundChrome && attempts < 30000) { // Give it some attempts to find the chrome.dll module
+	while (!hasFoundChrome && attempts < 30000) {
 		HMODULE modules[1024];
 		DWORD cbNeeded;
 
 		if (EnumProcessModules(proc, modules, sizeof(modules), &cbNeeded)) {
-			for (int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
+			HMODULE candidateModule = nullptr;
+			std::wstring candidatePath;
+			std::wstring candidateVersion;
+			int candidateCount = 0;
+			const size_t moduleCount = (std::min)(static_cast<size_t>(cbNeeded) / sizeof(HMODULE),
+				static_cast<size_t>(ARRAYSIZE(modules)));
+			for (size_t i = 0; i < moduleCount; i++) {
 				HMODULE mod = modules[i];
 				TCHAR modulePath[1024];
 
-				if (GetModuleFileName(mod, modulePath, ARRAYSIZE(modulePath))) { // Analyze the module's file path with regex
-					if (std::regex_search(modulePath, chromeDllRegex)) {
-						std::wcout << L"Found chrome.dll module: " << modulePath << L" with handle: " << mod << std::endl;
-						
-						ChromePatch::patches.chromeDll = mod;
-						ChromePatch::patches.chromeDllPath = modulePath;
-						hasFoundChrome = true;
-						break; /* Break this module enumeration after the right dll has been found
-								  There is also a special case for newer versions of MSEdge, where 
-								  other dlls matche with the regex query and would set a wrong one.
-							   */
+				if (GetModuleFileName(mod, modulePath, ARRAYSIZE(modulePath))) {
+					std::wstring version;
+					if (ChromePatch::patches.IsCandidateModulePath(modulePath, &version)) {
+						candidateCount++;
+						candidateModule = mod;
+						candidatePath = modulePath;
+						candidateVersion = version;
 					}
 				}
+			}
+			if (candidateCount > 1) {
+				std::cerr << "Module selector matched more than one loaded module; patch fail closed" << std::endl;
+				selectorRejected = true;
+				break;
+			}
+			if (candidateCount == 1) {
+				std::wcout << L"Selected Edge " << candidateVersion << L" module: " << candidatePath << std::endl;
+				ChromePatch::patches.chromeDll = candidateModule;
+				ChromePatch::patches.chromeDllPath = candidatePath;
+				hasFoundChrome = true;
 			}
 		}
 		else {
@@ -126,37 +154,26 @@ BOOL APIENTRY ThreadMain(LPVOID lpModule) {
 		Sleep(1); // Sleeping to let the process load its modules
 		attempts++;
 	}
-	ChromePatch::SuspendOtherThreads();
-	CloseHandle(proc);
-
-	int successfulPatches = -1;
 	if (!hasFoundChrome) {
-		std::cerr << "Couldn't find the chrome.dll, exiting" << std::endl;
+		if (!selectorRejected) {
+			std::cerr << "No loaded msedge.dll satisfied the configured root/name/version selector; patch fail closed" << std::endl;
+		}
 	}
 	else {
+		ChromePatch::SuspendOtherThreads();
 		try {
-			const ChromePatch::ReadPatchResult readResult = ChromePatch::patches.ReadPatchFile();
-			
-			std::cout << "Read Result: UWV: " << readResult.UsingWrongVersion << std::endl;
-			successfulPatches = ChromePatch::patches.ApplyPatches();
+			if (ChromePatch::patches.ApplyPatches() == 0) {
+				std::cerr << "Patch transaction failed and was rolled back" << std::endl;
+			}
 		}
 		catch (const std::exception& ex) {
 			std::cerr << "Error: " << ex.what() << std::endl;
 		}
 	}
 
-	std::cout << "Unloading patcher dll and resuming threads" << std::endl;
-	ChromePatch::ResumeOtherThreads();
-
-	if (successfulPatches == 0) { // 0 if literally no patches were applied, but not -1 because it shows that it at least tried
-		std::cerr << "Trying to reapply patches with running threads after a total failure..." << std::endl;
-
-		try {
-			ChromePatch::patches.ApplyPatches();
-		}
-		catch (const std::exception& ex) {
-			std::cerr << "Error: " << ex.what() << std::endl;
-		}
+	if (hasFoundChrome) {
+		std::cout << "Unloading patcher dll and resuming threads" << std::endl;
+		ChromePatch::ResumeOtherThreads();
 	}
 
 	if (fout != nullptr)

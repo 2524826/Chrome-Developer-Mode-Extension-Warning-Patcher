@@ -1,5 +1,6 @@
 ﻿using ChromeDevExtWarningPatcher.InstallationFinder;
 using ChromeDevExtWarningPatcher.Patches;
+using EdgeWarningPatcher.Verifier;
 using Microsoft.Win32;
 using Microsoft.Win32.TaskScheduler;
 using System;
@@ -7,6 +8,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -15,7 +17,7 @@ using Task = Microsoft.Win32.TaskScheduler.Task;
 
 namespace ChromeDevExtWarningPatcher {
 	internal class PatcherInstaller {
-		private static readonly uint FILE_HEADER = BitConverter.ToUInt32(BitConverter.GetBytes(0xCE161D6E).Reverse().ToArray(), 0);
+		private static readonly uint FILE_HEADER = BitConverter.ToUInt32(BitConverter.GetBytes(0xCE161D6F).Reverse().ToArray(), 0);
 		private static readonly uint PATCH_HEADER = BitConverter.ToUInt32(BitConverter.GetBytes(0x8A7C5000).Reverse().ToArray(), 0); // Reverse because of wrong endianess
 
 		[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
@@ -28,43 +30,53 @@ namespace ChromeDevExtWarningPatcher {
 			this.installationPaths = installationPaths;
 		}
 
-		private static byte[] GetPatchFileBinary(InstallationPaths paths, List<int> disabledGroups) {
+		private static void WriteString(BinaryWriter writer, string value) {
+			byte[] bytes = Encoding.UTF8.GetBytes(value);
+			writer.Write(bytes.Length);
+			writer.Write(bytes);
+		}
+
+		private static PatchRule GetForwardCompatibleRule() {
+			using Stream rulesStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(
+				"ChromeDevExtWarningPatcher.patterns.xml") ??
+				throw new InvalidDataException("Embedded patterns.xml is missing.");
+			PatchRule[] rules = RuleLoader.Load(rulesStream).Where(rule =>
+				rule.Browser.Equals("edge", StringComparison.OrdinalIgnoreCase) &&
+				rule.Module.Equals("msedge.dll", StringComparison.OrdinalIgnoreCase)).ToArray();
+			if (rules.Length != 1) {
+				throw new InvalidDataException($"Expected exactly one guarded Edge rule, found {rules.Length}.");
+			}
+			return rules[0];
+		}
+
+		private static byte[] GetPatchFileBinary(InstallationPaths paths, PatchRule rule) {
 			MemoryStream stream = new MemoryStream();
 			BinaryWriter writer = new BinaryWriter(stream);
 
-			writer.Write(FILE_HEADER); // Magic value
-			writer.Write(paths.ChromeDllPath!.Length); // Needed, so it takes 4 bytes
-			writer.Write(Encoding.ASCII.GetBytes(paths.ChromeDllPath));
+			writer.Write(FILE_HEADER); // Versioned magic value for the forward-compatible selector format
+			WriteString(writer, Path.GetFullPath(Path.GetDirectoryName(paths.ChromeExePath!)!));
+			WriteString(writer, rule.Module);
+			WriteString(writer, rule.MinimumVersion);
+			WriteString(writer, rule.MaximumVersion);
+			WriteString(writer, rule.Id);
 
-			foreach (BytePatch patch in MainClass.BytePatchManager!.BytePatches) {
-				if (disabledGroups.Contains(patch.Group)) {
-					continue;
+			byte[] nativePattern = rule.Pattern.ToLegacyWildcardBytes();
+			foreach (PatchWrite write in rule.Writes) {
+				if (write.Expected.Length != 1 || write.Replacement.Length != 1) {
+					throw new InvalidDataException("The native runtime currently permits only guarded single-byte writes.");
 				}
 
 				writer.Write(PATCH_HEADER);
-				writer.Write(patch.Pattern.AlternativePatternsX64.Count);
-
-				foreach (byte[] pattern in patch.Pattern.AlternativePatternsX64) { // Write all possible patterns
-					writer.Write(pattern.Length);
-					writer.Write(pattern);
-				}
-
-				writer.Write(patch.Offsets.Count); // Write offset list
-				foreach (int offset in patch.Offsets) {
-					writer.Write(offset);
-				}
-
-				if (patch.NewBytes == null) { // If there is no NewBytes element => write length 0
-					writer.Write(0);
-				} else { // Write the NewBytes array
-					writer.Write(patch.NewBytes.Length);
-					writer.Write(patch.NewBytes);
-				}
-
-				writer.Write(patch.OrigByte); // Write the rest of the patch data
-				writer.Write(patch.PatchByte);
-				writer.Write(patch.IsSig);
-				writer.Write(patch.SigOffset);
+				writer.Write(1); // one complete-function pattern
+				writer.Write(nativePattern.Length);
+				writer.Write(nativePattern);
+				writer.Write(1); // one exact write offset
+				writer.Write(write.Offset);
+				writer.Write(0); // no legacy multi-byte replacement payload
+				writer.Write(write.Expected[0]);
+				writer.Write(write.Replacement[0]);
+				writer.Write(false); // no relative signature resolution
+				writer.Write(0);
 			}
 
 			writer.Close();
@@ -116,6 +128,9 @@ namespace ChromeDevExtWarningPatcher {
 
 		public delegate void WriteToLog(string str);
 		public bool Install(WriteToLog log, List<int> disabledGroups) {
+			PatchRule rule = ValidatePreflight(disabledGroups, log);
+			log($"Preflight passed: forward-compatible rule {rule.Id}, x64 PE, .text unique match, and original bytes verified");
+
 			using (TaskService ts = new TaskService()) {
 				foreach (Task task in ts.RootFolder.Tasks) {
 					if (task.Name.Equals("ChromeDllInjector")) {
@@ -141,7 +156,7 @@ namespace ChromeDevExtWarningPatcher {
 					string appDir = Path.GetDirectoryName(paths.ChromeExePath!)!;
 
 					// Write patch data info file
-					byte[] patchData = GetPatchFileBinary(paths, disabledGroups);
+					byte[] patchData = GetPatchFileBinary(paths, rule);
 					File.WriteAllBytes(Path.Combine(appDir, "ChromePatches.bin"), patchData);
 					log("Wrote patch file to " + appDir);
 
@@ -205,6 +220,47 @@ namespace ChromeDevExtWarningPatcher {
 
 			log("Patches installed!");
 			return true;
+		}
+
+		private PatchRule ValidatePreflight(List<int> disabledGroups, WriteToLog log) {
+			int[] enabledGroups = MainClass.BytePatchManager!.BytePatches
+				.Select(patch => patch.Group)
+				.Distinct()
+				.Where(group => !disabledGroups.Contains(group))
+				.OrderBy(group => group)
+				.ToArray();
+			if (!enabledGroups.SequenceEqual(new[] { 0 })) {
+				throw new InvalidOperationException("This maintenance build permits only patch group 0 (Remove extension warning).");
+			}
+			if (this.installationPaths.Count == 0) {
+				throw new InvalidOperationException("No Edge installation was selected.");
+			}
+			PatchRule rule = GetForwardCompatibleRule();
+
+			foreach (InstallationPaths paths in this.installationPaths) {
+				if (!paths.Name.Equals("Edge", StringComparison.Ordinal) ||
+					paths.ChromeDllPath == null || paths.ChromeExePath == null) {
+					throw new NotSupportedException("Only an automatically detected Microsoft Edge installation is supported.");
+				}
+				if (!File.Exists(paths.ChromeDllPath) || !File.Exists(paths.ChromeExePath) ||
+					!Path.GetFileName(paths.ChromeDllPath).Equals("msedge.dll", StringComparison.OrdinalIgnoreCase) ||
+					!Path.GetFileName(paths.ChromeExePath).Equals("msedge.exe", StringComparison.OrdinalIgnoreCase)) {
+					throw new InvalidOperationException("The selected Edge executable or msedge.dll is missing or has an unexpected name.");
+				}
+				string? version = Directory.GetParent(paths.ChromeDllPath)?.Name;
+				if (version == null || !Version.TryParse(version, out _)) {
+					throw new NotSupportedException($"Cannot determine a valid Edge version from {paths.ChromeDllPath}.");
+				}
+				if (!paths.Is64Bit()) {
+					throw new NotSupportedException("Only x64 Edge and an x64 msedge.dll are supported.");
+				}
+				VerificationReport report = PatchVerifier.Verify(paths.ChromeDllPath, rule, "edge", version);
+				if (!report.Passed) {
+					throw new NotSupportedException(report.Reason);
+				}
+				log($"Verified Edge {version}: SHA-256 {report.ModuleSha256}, match count {report.MatchCount}");
+			}
+			return rule;
 		}
 
 		public bool UninstallAll(WriteToLog log) {

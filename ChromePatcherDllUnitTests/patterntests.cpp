@@ -55,6 +55,20 @@ namespace ChromePatch {
 			Assert::IsTrue(SimdPatternSearcher::IsCpuSupported());
 		}
 
+		TEST_METHOD(ForwardCompatibleModuleSelectorTest) {
+			const wchar_t* root = L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application";
+			Assert::IsTrue(ModuleSelector::IsCandidate(root, L"msedge.dll", L"151.0.0.0", L"*",
+				L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\151.0.4129.59\\msedge.dll"));
+			Assert::IsTrue(ModuleSelector::IsCandidate(root, L"msedge.dll", L"151.0.0.0", L"*",
+				L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\152.1.5000.7\\msedge.dll"));
+			Assert::IsFalse(ModuleSelector::IsCandidate(root, L"msedge.dll", L"151.0.0.0", L"*",
+				L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\150.0.4000.0\\msedge.dll"));
+			Assert::IsFalse(ModuleSelector::IsCandidate(root, L"msedge.dll", L"151.0.0.0", L"*",
+				L"C:\\Other\\Application\\152.1.5000.7\\msedge.dll"));
+			Assert::IsFalse(ModuleSelector::IsCandidate(root, L"msedge.dll", L"151.0.0.0", L"*",
+				L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\152.1.5000.7\\other.dll"));
+		}
+
 	private:
 		// Create two patches: Patch 1 has 2 patterns, of which one has a result. Patch 2 has 1 pattern with a result, but with offsets.
 		static std::vector<Patch> CreatePatches() {

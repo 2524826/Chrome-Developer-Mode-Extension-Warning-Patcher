@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "Edge Warning Patcher Reproduction Fixture",
+  "version": "1.0.0",
+  "description": "Minimal unpacked extension used only to reproduce the developer-mode warning.",
+  "background": {
+    "service_worker": "service-worker.js"
+  }
+}

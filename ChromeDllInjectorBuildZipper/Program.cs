@@ -49,6 +49,10 @@ namespace ChromeDllInjectorBuildZipper {
 			DirectoryInfo current = new DirectoryInfo(buildFolder);
 
 			foreach (FileInfo file in current.EnumerateFiles()) {
+				if (ZipArchiveExtension.IsDebugArtifact(file.Name)) {
+					continue;
+				}
+
 				zip.CreateEntryFromFile(file.FullName, file.Name);
 			}
 

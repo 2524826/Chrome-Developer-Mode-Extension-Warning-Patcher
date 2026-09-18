@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
 <!-- 
-	This file contains all patterns of functions that need to be patched and its patches. It is downloaded everytime you start the patcher and is saved in your %temp% folder. This allows auto-updating patterns.
+	This file contains the guarded patch rule and historical patterns. It is embedded into the installer at build time; runtime network rule downloads are not used.
 	Every pattern & patch has some comments that give hints on how to find the function.
 	Alternative patterns exist so that the patches work on older and other versions (there are differences between Chromium 80 & 81 and Chrome & Edge (do they use another compiler?)).
 	Patterns here are stored in the default IDA format. ? is replaced to 0xFF in the C# code (and is still treated as a wildcard).
@@ -13,16 +13,38 @@
 	For Brave: Download .sym debug files at https://github.com/brave/brave-browser/releases/tag (Search for the function name and add the offset to the base address)
 -->
 
-<Defaults version="6.0">
+<Defaults version="7.1" schemaVersion="2">
+	<PatchTargets schemaVersion="1">
+		<!--
+			Guarded, forward-compatible rule verified on Microsoft Edge Stable
+			151.0.4129.59 x64. Later Edge versions may use this rule only while the
+			complete instruction pattern, unique-match gate, and original write bytes
+			continue to match. Any drift fails closed before an in-memory write.
+			The pattern is the complete DevModeBubbleDelegate::ShouldIncludeExtension body.
+			Question marks are wildcards; FF is a literal byte in this schema.
+			The two writes change only the UNPACKED (4) and COMMAND_LINE (8) location
+			comparands, causing this delegate to include no extensions while leaving the
+			extensions enabled and all unrelated security decisions untouched.
+		-->
+		<PatchTarget
+		id="edge-extension-warning-151-plus-x64"
+			browser="edge"
+			module="msedge.dll"
+			arch="x64"
+			minVersion="151.0.0.0"
+			maxVersion="*"
+			section=".text"
+			expectedMatches="1">
+			<BytePattern>56 48 83 EC 20 48 89 D6 48 89 D1 E8 ?? ?? ?? ?? 89 C1 B0 01 83 F9 04 74 0E 48 89 F1 E8 ?? ?? ?? ?? 83 F8 08 0F 94 C0 48 83 C4 20 5E C3</BytePattern>
+			<Write offset="0x16" expected="04" replacement="FF" />
+			<Write offset="0x23" expected="08" replacement="FF" />
+		</PatchTarget>
+	</PatchTargets>
+
 	<Patterns>
 		<Pattern name="Remove Extension Warning">
-			<!-- DevModeBubbleDelegate::ShouldIncludeExtension; ("ProxyOverriddenBubble.UserSelection" 2nd function in the vtable) -->
-			<!-- This patch might not do anything (except for Edge), because Chromium has removed the warning -->
-			<BytePattern>56 48 83 EC 20 48 89 D6 48 89 D1 E8 ? ? ? ? 89 C1 B0 01 83</BytePattern> <!-- Edg 100 -->
-			<BytePattern>56 48 83 EC 20 48 89 D6 48 89 D1 E8 ? ? ? ? 89 C1</BytePattern> <!-- Chr 79-84 -->
-
-			<!-- Most likely not used, because the pattern above can be found in Edge -->
-			<BytePattern>56 48 83 EC ? 48 89 D6 48 89 D1 E8 ? ? ? ? 83 F8 ? 74</BytePattern> <!-- Edg 81-84 -->
+			<!-- Edge 151.0.4129.59 x64: complete DevModeBubbleDelegate::ShouldIncludeExtension body. -->
+			<BytePattern>56 48 83 EC 20 48 89 D6 48 89 D1 E8 ? ? ? ? 89 C1 B0 01 83 F9 04 74 0E 48 89 F1 E8 ? ? ? ? 83 F8 08 0F 94 C0 48 83 C4 20 5E C3</BytePattern>
 		</Pattern>
 	
 		<Pattern name="Remove Debug Warning">
@@ -200,7 +222,7 @@
 			<Tooltip>This patch removes the context menu option "Create QR code for this page" (Chrome only)</Tooltip>
 		</GroupedPatch>
 
-		<GroupedPatch group="6" default="true">
+		<GroupedPatch group="6" default="false">
 			<Name>Enable webRequestBlocking for MV3</Name>
 			<Tooltip>This patch enables the extension API webRequestBlocking (often used by Adblockers) for Manifest V3 extensions</Tooltip>
 		</GroupedPatch>
