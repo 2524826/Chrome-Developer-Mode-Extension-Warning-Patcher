@@ -86,7 +86,7 @@ jobs:
             }
           Copy-Item '.\x64\Release\ChromePatcherDll.dll' -Destination $binaryStage
           @'
-          7.1.1 release candidate
+          7.1.1 release
 
           This package is unsigned. Tests and test scripts were skipped at the user's request.
           The patch is conditionally compatible with Edge 151 and later only when the complete guarded signature and expected bytes match uniquely.
