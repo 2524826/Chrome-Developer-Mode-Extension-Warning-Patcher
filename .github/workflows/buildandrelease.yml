@@ -24,31 +24,31 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Restore release projects
-        shell: powershell
+        shell: pwsh
         run: |
           dotnet restore .\ChromeDllInjectorBuildZipper\ChromeDllInjectorBuildZipper.csproj
           dotnet restore .\ChromeDllInjector\ChromeDllInjector.csproj
           dotnet restore .\ChromeDevExtWarningPatcher\ChromeDevExtWarningPatcher.csproj
 
       - name: Build native Release x64
-        shell: powershell
+        shell: pwsh
         run: |
           $nativeOut = Join-Path $env:GITHUB_WORKSPACE 'x64\Release\'
           New-Item -ItemType Directory -Path $nativeOut -Force | Out-Null
           msbuild .\ChromePatcherDll\ChromePatcherDll.vcxproj /t:Rebuild /m /p:Configuration=Release /p:Platform=x64 /p:OutDir="$nativeOut" /p:ContinuousIntegrationBuild=true
 
       - name: Build Injector and regenerate embedded injector ZIP
-        shell: powershell
+        shell: pwsh
         run: |
           dotnet build .\ChromeDllInjectorBuildZipper\ChromeDllInjectorBuildZipper.csproj -c Release --no-restore
           dotnet build .\ChromeDllInjector\ChromeDllInjector.csproj -c Release --no-restore
 
       - name: Build patcher Release x64 with embedded resources
-        shell: powershell
+        shell: pwsh
         run: dotnet build .\ChromeDevExtWarningPatcher\ChromeDevExtWarningPatcher.csproj -c Release --no-restore
 
       - name: Check release component versions and packaging inputs
-        shell: powershell
+        shell: pwsh
         run: |
           $expected = @{
             'x64\Release\ChromePatcherDll.dll' = '7.1.1.0'
@@ -64,7 +64,7 @@ jobs:
           if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'ChromeDllInjector.zip') -PathType Leaf)) { throw 'Missing regenerated ChromeDllInjector.zip' }
 
       - name: Package binary and source archives
-        shell: powershell
+        shell: pwsh
         run: |
           $artifactRoot = Join-Path $env:GITHUB_WORKSPACE 'artifacts'
           $binaryStage = Join-Path $artifactRoot 'edge-warning-patcher-7.1.1-windows-x64'
